@@ -127,14 +127,9 @@ create policy "customers read own orders or admin" on public.orders
 for select to authenticated
 using ((select auth.uid()) = user_id or (select public.is_store_admin()));
 
+-- Customers must place orders through place_cash_order(), which validates current prices
+-- and stock on the server. Direct client inserts are intentionally not permitted.
 drop policy if exists "customers create own orders" on public.orders;
-create policy "customers create own orders" on public.orders
-for insert to authenticated
-with check (
-  (select auth.uid()) = user_id
-  and status = 'pending'
-  and payment_method = 'cash_on_delivery'
-);
 
 drop policy if exists "admins update orders" on public.orders;
 create policy "admins update orders" on public.orders
@@ -153,17 +148,8 @@ using (
   )
 );
 
+-- Order items are created atomically by place_cash_order(), not by direct client inserts.
 drop policy if exists "customers add items to own pending orders" on public.order_items;
-create policy "customers add items to own pending orders" on public.order_items
-for insert to authenticated
-with check (
-  exists (
-    select 1 from public.orders o
-    where o.id = order_id
-      and o.user_id = (select auth.uid())
-      and o.status = 'pending'
-  )
-);
 
 drop policy if exists "admins manage order items" on public.order_items;
 create policy "admins manage order items" on public.order_items
@@ -171,13 +157,110 @@ for all to authenticated
 using ((select public.is_store_admin()))
 with check ((select public.is_store_admin()));
 
+
+-- Create a customer profile automatically after signup.
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = ''
+as $
+begin
+  insert into public.profiles(id, full_name, phone)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data ->> 'full_name', ''),
+    coalesce(new.raw_user_meta_data ->> 'phone', '')
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$;
+
+drop trigger if exists on_auth_user_created_profile on auth.users;
+create trigger on_auth_user_created_profile
+after insert on auth.users
+for each row execute procedure public.handle_new_user();
+
+-- The server calculates the total from current product prices and reserves stock atomically.
+create or replace function public.place_cash_order(
+  p_customer_name text,
+  p_phone text,
+  p_delivery_address text,
+  p_items jsonb,
+  p_notes text default ''
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $
+declare
+  v_user_id uuid := auth.uid();
+  v_order_id uuid;
+  v_total bigint := 0;
+  v_item jsonb;
+  v_product public.products%rowtype;
+  v_qty integer;
+begin
+  if v_user_id is null then
+    raise exception 'برای ثبت سفارش ابتدا وارد حساب شوید';
+  end if;
+  if length(trim(coalesce(p_customer_name, ''))) < 2
+     or length(trim(coalesce(p_phone, ''))) < 10
+     or length(trim(coalesce(p_delivery_address, ''))) < 8 then
+    raise exception 'اطلاعات تحویل کامل نیست';
+  end if;
+  if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'سبد خرید خالی است';
+  end if;
+  if jsonb_array_length(p_items) > 50 then
+    raise exception 'تعداد اقلام سفارش بیش از حد مجاز است';
+  end if;
+
+  for v_item in select value from jsonb_array_elements(p_items)
+  loop
+    v_qty := (v_item ->> 'quantity')::integer;
+    if v_qty < 1 or v_qty > 100 then
+      raise exception 'تعداد کالا نامعتبر است';
+    end if;
+    select * into v_product
+      from public.products
+      where id = (v_item ->> 'product_id')::uuid and is_active = true
+      for update;
+    if not found then raise exception 'یکی از کالاها موجود نیست'; end if;
+    if v_product.stock < v_qty then
+      raise exception 'موجودی کالای % کافی نیست', v_product.name;
+    end if;
+    v_total := v_total + (v_product.price_toman * v_qty);
+  end loop;
+
+  insert into public.orders(user_id, customer_name, phone, delivery_address, total_toman, notes)
+  values (v_user_id, trim(p_customer_name), trim(p_phone), trim(p_delivery_address),
+          v_total, coalesce(p_notes, ''))
+  returning id into v_order_id;
+
+  for v_item in select value from jsonb_array_elements(p_items)
+  loop
+    v_qty := (v_item ->> 'quantity')::integer;
+    select * into v_product from public.products
+      where id = (v_item ->> 'product_id')::uuid for update;
+    insert into public.order_items(order_id, product_id, product_name, unit_price_toman, quantity, line_total_toman)
+    values (v_order_id, v_product.id, v_product.name, v_product.price_toman,
+            v_qty, v_product.price_toman * v_qty);
+    update public.products set stock = stock - v_qty, updated_at = now()
+      where id = v_product.id;
+  end loop;
+  return v_order_id;
+end;
+$;
+
+revoke all on function public.place_cash_order(text,text,text,jsonb,text) from public;
+grant execute on function public.place_cash_order(text,text,text,jsonb,text) to authenticated;
+
 -- Explicitly expose only the intended tables to the Data API (new Supabase projects
 -- may not expose public-schema tables automatically).
 grant select on public.categories, public.products to anon, authenticated;
 grant select, insert, update on public.profiles to authenticated;
-grant select, insert on public.orders to authenticated;
-grant update on public.orders to authenticated;
-grant select, insert on public.order_items to authenticated;
+grant select, update on public.orders to authenticated;
+grant select on public.order_items to authenticated;
 grant update, delete on public.categories, public.products to authenticated;
 grant all on public.categories, public.products, public.orders, public.order_items to authenticated;
 
